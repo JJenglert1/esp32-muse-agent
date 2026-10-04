@@ -5,6 +5,10 @@ Hold a button, ask a question, and it answers out loud with a cute animated face
 It runs on Meta's free, open source [Muse Gadget SDK](https://github.com/facebookincubator/muse-gadget-sdk),
 and this guide walks you through it step by step. No soldering, and you don't need to be a programmer.
 
+### ▶️ See it in action
+
+- [Watch the demo on X](https://x.com/JJEnglert/status/2106490054998741474)
+
 <!-- Add a photo or GIF of the finished gadget here: ![My Muse gadget](docs/gadget.jpg) -->
 
 ## What you'll end up with
