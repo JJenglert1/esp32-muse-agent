@@ -5,6 +5,10 @@ Hold a button, ask a question, and it answers out loud with a cute animated face
 It runs on Meta's free, open source [Muse Gadget SDK](https://github.com/facebookincubator/muse-gadget-sdk),
 and this guide walks you through it step by step. No soldering, and you don't need to be a programmer.
 
+> **🎁 Free Muse Home Link:** Meta made a first batch of **5,000 Muse Home Link** devices and is giving
+> them **free to Muse subscribers in the US**. You have to request one at
+> **[gadgets.muse.ai](https://gadgets.muse.ai/)**. ([See the announcement](https://x.com/natfriedman/status/2106099383037309211))
+
 ### ▶️ See it in action
 
 - [Watch the demo on X](https://x.com/JJEnglert/status/2106490054998741474)
@@ -56,7 +60,8 @@ You also need:
 
 ## Step 2: Get your Muse account and SDK token (free)
 
-[Muse](https://gadgets.muse.ai/) is Meta's personal AI agent. The Gadget SDK is **free and open source**,
+[Muse](https://gadgets.muse.ai/) is Meta's personal AI agent. Start at **[gadgets.muse.ai](https://gadgets.muse.ai/)**,
+Meta's home for Muse gadgets, where you'll also find the free Home Link offer above. The Gadget SDK is **free and open source**,
 and Muse has a **free plan with a weekly usage limit**. Paid plans give you more if you need it.
 Check [Muse's current plans](https://www.meta.com/help/subscriptions/1021145227643680/) before you start.
 
