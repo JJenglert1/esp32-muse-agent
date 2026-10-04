@@ -1,0 +1,1315 @@
+diff --git a/esp32/components/muse/CMakeLists.txt b/esp32/components/muse/CMakeLists.txt
+index 34982cd..a246ddb 100644
+--- a/esp32/components/muse/CMakeLists.txt
++++ b/esp32/components/muse/CMakeLists.txt
+@@ -43,7 +43,7 @@ if(CONFIG_MUSE_ENABLED)
+         "muse_link.c"
+         "muse_ble.c")
+     if(CONFIG_MUSE_HATCH)
+-        list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp")
++        list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_tts_openai.c")
+         list(APPEND embed "test_reply.mp3")   # muse_hatch_mp3_selftest
+     else()
+         list(APPEND srcs "muse_chat_link.c")   # text replies over Link's session
+@@ -62,6 +62,8 @@ if(CONFIG_MUSE_ENABLED)
+     if(CONFIG_MUSE_BOARD_WAVESHARE_S3_175C OR CONFIG_MUSE_BOARD_WAVESHARE_S3_175)
+         # One driver: the 1.75 differs only in pins (its BSP's) and its PWR key.
+         list(APPEND srcs "boards/board_waveshare_s3_175c.c" "boards/muse_lcd_bands.c")
++    elseif(CONFIG_MUSE_BOARD_WAVESHARE_S3_18)
++        list(APPEND srcs "boards/board_waveshare_s3_18.c" "boards/muse_lcd_bands.c")
+     elseif(CONFIG_MUSE_BOARD_AIPI)
+         list(APPEND srcs "boards/board_aipi.c")
+     elseif(CONFIG_MUSE_BOARD_ESPRESSIF_BOX_3)
+@@ -85,7 +87,7 @@ if(CONFIG_MUSE_ENABLED)
+ elseif(CONFIG_HOMEHUB_VOICE)
+     # The Voice PE board uses just the Hatch voice session; the project's main/
+     # voice_muse_chat.c stands in for the Muse settings, Wi-Fi and Link hooks.
+-    list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_chat_text.c" "muse_text.c")
++    list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_tts_openai.c" "muse_chat_text.c" "muse_text.c")
+     list(APPEND embed "test_reply.mp3")
+ endif()
+ 
+diff --git a/esp32/components/muse/Kconfig b/esp32/components/muse/Kconfig
+index 3c1f318..4b5639a 100644
+--- a/esp32/components/muse/Kconfig
++++ b/esp32/components/muse/Kconfig
+@@ -35,6 +35,10 @@ menu "Muse"
+             bool "Waveshare ESP32-S3-Touch-AMOLED-1.75 (not the 1.75C)"
+             depends on IDF_TARGET_ESP32S3
+ 
++        config MUSE_BOARD_WAVESHARE_S3_18
++            bool "Waveshare ESP32-S3-Touch-AMOLED-1.8 V2 (CO5300, CST820)"
++            depends on IDF_TARGET_ESP32S3
++
+         config MUSE_BOARD_AIPI
+             bool "AIPI Lite (ESP32-S3, two buttons, no touch)"
+             depends on IDF_TARGET_ESP32S3
+@@ -78,6 +82,7 @@ menu "Muse"
+         string
+         default "waveshare_s3_175c" if MUSE_BOARD_WAVESHARE_S3_175C
+         default "waveshare_s3_175" if MUSE_BOARD_WAVESHARE_S3_175
++        default "waveshare_s3_18" if MUSE_BOARD_WAVESHARE_S3_18
+         default "aipi" if MUSE_BOARD_AIPI
+         default "espressif_box_3" if MUSE_BOARD_ESPRESSIF_BOX_3
+         default "waveshare_c6_18" if MUSE_BOARD_WAVESHARE_C6_18
+@@ -118,4 +123,35 @@ menu "Muse"
+             them. Needs PSRAM. Without it, voice notes go over Home Link's own
+             session to its paired VM and replies are shown as text.
+ 
++    config MUSE_TTS_OPENAI_KEY
++        string "OpenAI API key for spoken replies"
++        depends on MUSE_HATCH
++        default ""
++        help
++            Empty: replies are shown as text only. Set: each reply is sent to
++            OpenAI's speech API and played, captions following. The key is
++            compiled into the firmware and can be read out of flash, so use a
++            key with a low spending limit. Set it only in the build folder's
++            sdkconfig; never commit it.
++
++    config MUSE_TTS_OPENAI_MODEL
++        string "OpenAI speech model"
++        depends on MUSE_HATCH
++        default "gpt-4o-mini-tts"
++
++    config MUSE_TTS_OPENAI_VOICE
++        string "OpenAI voice"
++        depends on MUSE_HATCH
++        default "coral"
++        help
++            One of OpenAI's built-in voices, for example alloy, ash, coral,
++            echo, fable, nova, onyx, sage or shimmer.
++
++    config MUSE_TTS_OPENAI_INSTRUCTIONS
++        string "Speaking style"
++        depends on MUSE_HATCH
++        default "Speak warmly and naturally, at a relaxed conversational pace."
++        help
++            How the voice should sound. Only gpt-4o-mini-tts uses it.
++
+ endmenu
+diff --git a/esp32/components/muse/boards/board_waveshare_s3_18.c b/esp32/components/muse/boards/board_waveshare_s3_18.c
+new file mode 100644
+index 0000000..06853b5
+--- /dev/null
++++ b/esp32/components/muse/boards/board_waveshare_s3_18.c
+@@ -0,0 +1,471 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/*
++ * Waveshare ESP32-S3-Touch-AMOLED-1.8 V2: ESP32-S3R8 (16 MB flash, 8 MB octal
++ * PSRAM), rectangular 368x448 CO5300 AMOLED on QSPI with CST820 touch, ES8311
++ * codec with one analog mic and a speaker amp on GPIO46, AXP2101 PMU. BOOT
++ * (GPIO0) talks; PWR reaches the ESP32 only through the AXP2101.
++ *
++ * Not the V1 board (SH8601 panel, FT3168 touch). Everything shares one I2C
++ * bus (SDA 15, SCL 14). The TCA9554 expander (0x20) drives P0 panel reset,
++ * P1 panel power, P2 touch reset and P7 SD chip select.
++ *
++ * Pins are from Waveshare's BSP, waveshare/esp32_s3_touch_amoled_1_8 2.0.3
++ * (include/bsp/esp32_s3_touch_amoled_1_8.h), the panel init commands from the
++ * same BSP, and the expander bits and reset order from Waveshare's V2 examples
++ * (examples/esp-idf/90_axp2101_pmu/components/board_variant/board_variant.c).
++ * The BSP isn't used directly: its bsp_display_new() sizes SPI transfers for a
++ * whole frame and it pulls in esp_lvgl_port. With CST820 touch the panel's
++ * columns start at 16 (the BSP's BSP_LCD_CST816S_X_GAP), verified on this
++ * board. The CST820 is read like the StopWatch's.
++ */
++#include <string.h>
++
++#include "driver/gpio.h"
++#include "driver/i2c_master.h"
++#include "driver/i2s_std.h"
++#include "driver/spi_master.h"
++#include "esp_check.h"
++#include "esp_codec_dev_defaults.h"
++#include "esp_lcd_co5300.h"
++#include "esp_lcd_panel_io.h"
++#include "esp_lcd_panel_ops.h"
++#include "esp_log.h"
++#include "esp_timer.h"
++#include "esp_lv_adapter.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/semphr.h"
++#include "freertos/task.h"
++
++#include "muse_audio.h"
++#include "muse_board.h"
++#include "muse_lcd_bands.h"
++#include "muse_mem.h"
++#include "muse_pmu.h"
++
++static const char *TAG = "board";
++
++#define LCD_H_RES 368
++#define LCD_V_RES 448
++#define LCD_GAP_X 16               /* the 368 columns start at 16 with CST820 touch */
++#define LCD_HOST SPI2_HOST
++#define LCD_CS GPIO_NUM_12
++#define LCD_SCLK GPIO_NUM_11
++#define LCD_D0 GPIO_NUM_4
++#define LCD_D1 GPIO_NUM_5
++#define LCD_D2 GPIO_NUM_6
++#define LCD_D3 GPIO_NUM_7
++#define DRAW_BUF_LINES 112         /* four bands to the screen (muse_lcd_bands.h) */
++#define LCD_CHUNK_BYTES (LCD_H_RES * 8 * 2)
++
++#define I2C_SDA GPIO_NUM_15
++#define I2C_SCL GPIO_NUM_14
++#define I2S_MCLK GPIO_NUM_16
++#define I2S_BCLK GPIO_NUM_9
++#define I2S_WS GPIO_NUM_45
++#define I2S_DOUT GPIO_NUM_8
++#define I2S_DIN GPIO_NUM_10
++#define SPK_PA_PIN GPIO_NUM_46
++
++#define TALK_GPIO GPIO_NUM_0       /* BOOT */
++#define PMU_KEY_EVERY 2            /* poll the PMU over I2C every 20 ms */
++#define TALK_SLIP_US (400 * 1000)  /* BOOT must stay up this long to count as let go */
++
++#define TP_ADDR 0x15
++#define TP_REG_POINTS 0x02         /* finger count, then X and Y, 12 bits each */
++#define TP_REG_SLEEP 0xE5          /* 0x03: deep sleep until reset */
++#define TP_REG_NO_AUTO_SLEEP 0xFE  /* else it stops answering I2C when idle */
++
++#define IOE_ADDR 0x20
++#define IOE_OUT 0x01
++#define IOE_CONFIG 0x03            /* 1 = input */
++#define IOE_LCD_RST BIT(0)
++#define IOE_LCD_PWR BIT(1)
++#define IOE_TP_RST BIT(2)
++#define IOE_SD_CS BIT(7)
++#define IOE_OUTPUTS (IOE_LCD_RST | IOE_LCD_PWR | IOE_TP_RST | IOE_SD_CS)
++
++static i2c_master_bus_handle_t s_i2c;
++static i2c_master_dev_handle_t s_ioe, s_tp;
++static SemaphoreHandle_t s_ioe_lock;
++static uint8_t s_ioe_out;
++static esp_lcd_panel_io_handle_t s_io;
++static esp_lcd_panel_handle_t s_panel;
++static muse_gpio_button_t s_talk;
++
++static esp_err_t reg_read(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *buf, size_t n)
++{
++    esp_err_t err = ESP_FAIL;
++    for (int i = 0; i < 3 && err != ESP_OK; i++) {
++        err = i2c_master_transmit_receive(dev, &reg, 1, buf, n, 50);
++    }
++    return err;
++}
++
++static esp_err_t reg_write(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t val)
++{
++    const uint8_t buf[2] = { reg, val };
++    esp_err_t err = ESP_FAIL;
++    for (int i = 0; i < 3 && err != ESP_OK; i++) {
++        err = i2c_master_transmit(dev, buf, sizeof(buf), 50);
++    }
++    return err;
++}
++
++/* The init and input tasks both pulse the touch reset; one write at a time. */
++static esp_err_t ioe_set(uint8_t pins, bool high)
++{
++    xSemaphoreTake(s_ioe_lock, portMAX_DELAY);
++    s_ioe_out = high ? s_ioe_out | pins : s_ioe_out & ~pins;
++    esp_err_t err = reg_write(s_ioe, IOE_OUT, s_ioe_out);
++    xSemaphoreGive(s_ioe_lock);
++    return err;
++}
++
++static esp_err_t add_device(uint8_t addr, uint32_t hz, i2c_master_dev_handle_t *dev)
++{
++    const i2c_device_config_t cfg = {
++        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
++        .device_address = addr,
++        .scl_speed_hz = hz,
++    };
++    return i2c_master_bus_add_device(s_i2c, &cfg, dev);
++}
++
++/* Reset pulse on the touch controller, then keep it answering while idle. */
++static void tp_reset(void)
++{
++    ioe_set(IOE_TP_RST, false);
++    vTaskDelay(pdMS_TO_TICKS(10));
++    ioe_set(IOE_TP_RST, true);
++    vTaskDelay(pdMS_TO_TICKS(50));
++    if (reg_write(s_tp, TP_REG_NO_AUTO_SLEEP, 0x01) != ESP_OK) {
++        ESP_LOGW(TAG, "touch not answering");
++    }
++}
++
++static esp_err_t init(void)
++{
++    s_ioe_lock = xSemaphoreCreateMutex();
++    ESP_RETURN_ON_FALSE(s_ioe_lock, ESP_ERR_NO_MEM, TAG, "ioe lock");
++    const i2c_master_bus_config_t i2c_cfg = {
++        .i2c_port = I2C_NUM_0,
++        .sda_io_num = I2C_SDA,
++        .scl_io_num = I2C_SCL,
++        .clk_source = I2C_CLK_SRC_DEFAULT,
++        .glitch_ignore_cnt = 7,
++        .flags.enable_internal_pullup = true,
++    };
++    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_cfg, &s_i2c), TAG, "i2c");
++    ESP_RETURN_ON_ERROR(add_device(IOE_ADDR, 400000, &s_ioe), TAG, "ioe");
++    ESP_RETURN_ON_ERROR(add_device(TP_ADDR, 400000, &s_tp), TAG, "touch");
++
++    /* Waveshare's V2 order: the four expander pins become outputs held low
++     * (SD deselected), then all go high together, releasing both resets with
++     * the panel powered. */
++    s_ioe_out = IOE_SD_CS;
++    ESP_RETURN_ON_ERROR(reg_write(s_ioe, IOE_OUT, s_ioe_out), TAG, "ioe levels");
++    ESP_RETURN_ON_ERROR(reg_write(s_ioe, IOE_CONFIG, (uint8_t)~IOE_OUTPUTS), TAG, "ioe outputs");
++    vTaskDelay(pdMS_TO_TICKS(20));
++    ESP_RETURN_ON_ERROR(ioe_set(IOE_OUTPUTS, true), TAG, "panel reset");
++    vTaskDelay(pdMS_TO_TICKS(150));
++
++    ESP_RETURN_ON_ERROR(muse_gpio_button_init(&s_talk, TALK_GPIO), TAG, "boot button");
++    /* Only the PMU sees PWR: latch its edges for poll_buttons(). */
++    esp_err_t err = muse_pmu_init(s_i2c, true);
++    if (err != ESP_OK) {
++        ESP_LOGW(TAG, "PMU unavailable (%s): battery status disabled", esp_err_to_name(err));
++    }
++    /* The rails are left as the PMU booted them: which ones feed the panel
++     * and codec on the V2 isn't confirmed, so none are turned off. */
++    return ESP_OK;
++}
++
++/* Waveshare's BSP init for this panel. COLMOD and MADCTL come from the
++ * driver first; 0x2A/0x2B are rewritten by every draw. */
++static const co5300_lcd_init_cmd_t s_lcd_init[] = {
++    { 0xFE, (uint8_t[]){ 0x00 }, 1, 0 },
++    { 0xC4, (uint8_t[]){ 0x80 }, 1, 0 },
++    { 0x3A, (uint8_t[]){ 0x55 }, 1, 0 },        /* RGB565 */
++    { 0x35, (uint8_t[]){ 0x00 }, 1, 0 },        /* tearing line on */
++    { 0x53, (uint8_t[]){ 0x20 }, 1, 0 },        /* brightness control on */
++    { 0x51, (uint8_t[]){ 0xA0 }, 1, 0 },        /* brightness, until the UI sets its own */
++    { 0x63, (uint8_t[]){ 0xFF }, 1, 0 },
++    { 0x2A, (uint8_t[]){ 0x00, 0x00, 0x01, 0x6F }, 4, 0 },
++    { 0x2B, (uint8_t[]){ 0x00, 0x00, 0x01, 0xBF }, 4, 0 },
++    { 0x11, NULL, 0, 100 },                     /* sleep out */
++    { 0x29, NULL, 0, 0 },                       /* display on */
++};
++
++/* The CO5300 needs even-aligned update windows. */
++static void round_area(lv_event_t *e)
++{
++    lv_area_t *a = lv_event_get_param(e);
++    a->x1 &= ~1;
++    a->y1 &= ~1;
++    a->x2 |= 1;
++    a->y2 |= 1;
++}
++
++/* LVGL polls this from its own task. The CST820 reports one point. */
++static void tp_read(lv_indev_t *indev, lv_indev_data_t *data)
++{
++    (void)indev;
++    uint8_t b[5];
++    if (reg_read(s_tp, TP_REG_POINTS, b, sizeof(b)) != ESP_OK || (b[0] & 0x0F) == 0) {
++        data->state = LV_INDEV_STATE_RELEASED;
++        return;
++    }
++    int x = (b[1] & 0x0F) << 8 | b[2];
++    int y = (b[3] & 0x0F) << 8 | b[4];
++    data->point.x = x < LCD_H_RES ? x : LCD_H_RES - 1;
++    data->point.y = y < LCD_V_RES ? y : LCD_V_RES - 1;
++    data->state = LV_INDEV_STATE_PRESSED;
++}
++
++/* As on the Waveshare 1.75C, the bands go out through fixed internal buffers:
++ * DMA straight from PSRAM underflows on this panel while Wi-Fi is up. */
++static lv_display_t *display_start(lv_indev_t **touch)
++{
++    const spi_bus_config_t bus =
++        CO5300_PANEL_BUS_QSPI_CONFIG(LCD_SCLK, LCD_D0, LCD_D1, LCD_D2, LCD_D3, LCD_CHUNK_BYTES);
++    if (spi_bus_initialize(LCD_HOST, &bus, SPI_DMA_CH_AUTO) != ESP_OK) {
++        return NULL;
++    }
++    const esp_lcd_panel_io_spi_config_t io_cfg = CO5300_PANEL_IO_QSPI_CONFIG(LCD_CS, NULL, NULL);
++    if (esp_lcd_new_panel_io_spi(LCD_HOST, &io_cfg, &s_io) != ESP_OK) {
++        return NULL;
++    }
++    co5300_vendor_config_t vendor_cfg = {
++        .init_cmds = s_lcd_init,
++        .init_cmds_size = sizeof(s_lcd_init) / sizeof(s_lcd_init[0]),
++        .flags.use_qspi_interface = 1,
++    };
++    const esp_lcd_panel_dev_config_t panel_cfg = {
++        .reset_gpio_num = GPIO_NUM_NC,      /* the expander's P0, released in init() */
++        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
++        .bits_per_pixel = 16,
++        .vendor_config = &vendor_cfg,
++    };
++    if (esp_lcd_new_panel_co5300(s_io, &panel_cfg, &s_panel) != ESP_OK) {
++        return NULL;
++    }
++    esp_lcd_panel_reset(s_panel);
++    esp_lcd_panel_init(s_panel);
++    esp_lcd_panel_set_gap(s_panel, LCD_GAP_X, 0);
++    esp_lcd_panel_disp_on_off(s_panel, true);
++
++    esp_lv_adapter_config_t adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG();
++    adapter_cfg.task_core_id = MUSE_UI_CORE;
++    adapter_cfg.task_priority = MUSE_UI_PRIORITY;
++    if (esp_lv_adapter_init(&adapter_cfg) != ESP_OK) {
++        return NULL;
++    }
++    const esp_lv_adapter_display_config_t disp_cfg = {
++        .panel = s_panel,
++        .panel_io = s_io,
++        .profile = {
++            .interface = ESP_LV_ADAPTER_PANEL_IF_OTHER,
++            .rotation = ESP_LV_ADAPTER_ROTATE_0,
++            .hor_res = LCD_H_RES,
++            .ver_res = LCD_V_RES,
++        },
++        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_NONE,
++    };
++    lv_display_t *disp = muse_lcd_bands_register(disp_cfg, DRAW_BUF_LINES, LCD_CHUNK_BYTES);
++    if (!disp) {
++        return NULL;
++    }
++    lv_display_add_event_cb(disp, round_area, LV_EVENT_INVALIDATE_AREA, NULL);
++
++    tp_reset();
++    *touch = lv_indev_create();
++    if (!*touch) {
++        return NULL;
++    }
++    lv_indev_set_type(*touch, LV_INDEV_TYPE_POINTER);
++    lv_indev_set_display(*touch, disp);
++    lv_indev_set_read_cb(*touch, tp_read);
++    if (esp_lv_adapter_start() != ESP_OK) {
++        return NULL;
++    }
++    return disp;
++}
++
++static bool display_lock(int timeout_ms)
++{
++    return esp_lv_adapter_lock(timeout_ms) == ESP_OK;
++}
++
++static void send_brightness(void *level)
++{
++    /* CO5300 "write display brightness" (0x51). */
++    esp_lcd_panel_io_tx_param(s_io, (0x02 << 24) | (0x51 << 8), level, 1);
++}
++
++static void set_brightness(int pct)
++{
++    uint8_t level = (uint8_t)(pct * 255 / 100);
++    muse_lcd_bands_run(send_brightness, &level);
++}
++
++static void send_sleep(void *sleep)
++{
++    esp_lcd_panel_io_tx_param(s_io, (0x02 << 24) | ((*(bool *)sleep ? 0x10 : 0x11) << 8), NULL, 0);
++}
++
++/* Plain SLPIN/SLPOUT over the QSPI command path, as on the Waveshare 1.75C. */
++static void panel_sleep(bool sleep)
++{
++    muse_lcd_bands_run(send_sleep, &sleep);
++    vTaskDelay(pdMS_TO_TICKS(120));   /* settle before the next command */
++}
++
++/* Screen off: LVGL stops and the CST820 sleeps until its reset line wakes it. */
++static void display_pause(bool pause)
++{
++    if (pause) {
++        esp_lv_adapter_pause(-1);
++        reg_write(s_tp, TP_REG_SLEEP, 0x03);
++    } else {
++        tp_reset();
++        esp_lv_adapter_resume();
++    }
++}
++
++/* One ES8311 does both directions over a duplex I2S bus, clocked from MCLK. */
++static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t *mic)
++{
++    i2s_chan_handle_t tx, rx;
++    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
++    chan_cfg.auto_clear = true;
++    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &tx, &rx), TAG, "i2s channel");
++    const i2s_std_config_t std_cfg = {
++        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MUSE_AUDIO_RATE),
++        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
++        .gpio_cfg = {
++            .mclk = I2S_MCLK,
++            .bclk = I2S_BCLK,
++            .ws = I2S_WS,
++            .dout = I2S_DOUT,
++            .din = I2S_DIN,
++        },
++    };
++    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(tx, &std_cfg), TAG, "i2s tx");
++    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(rx, &std_cfg), TAG, "i2s rx");
++    ESP_RETURN_ON_ERROR(i2s_channel_enable(tx), TAG, "i2s tx on");
++    ESP_RETURN_ON_ERROR(i2s_channel_enable(rx), TAG, "i2s rx on");
++
++    audio_codec_i2s_cfg_t i2s_cfg = { .port = I2S_NUM_0, .rx_handle = rx, .tx_handle = tx };
++    const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_cfg);
++    audio_codec_i2c_cfg_t i2c_cfg = { .port = I2C_NUM_0, .addr = ES8311_CODEC_DEFAULT_ADDR, .bus_handle = s_i2c };
++    const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
++    const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
++    ESP_RETURN_ON_FALSE(data_if && ctrl_if && gpio_if, ESP_ERR_NO_MEM, TAG, "codec interfaces");
++
++    es8311_codec_cfg_t es_cfg = {
++        .ctrl_if = ctrl_if,
++        .gpio_if = gpio_if,
++        .codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH,
++        .pa_pin = SPK_PA_PIN,
++        .use_mclk = true,
++        .hw_gain = { .pa_voltage = 5.0, .codec_dac_voltage = 3.3 },
++    };
++    const audio_codec_if_t *codec = es8311_codec_new(&es_cfg);
++    ESP_RETURN_ON_FALSE(codec, ESP_FAIL, TAG, "ES8311 not responding");
++
++    esp_codec_dev_cfg_t out_cfg = { .dev_type = ESP_CODEC_DEV_TYPE_OUT, .codec_if = codec, .data_if = data_if };
++    esp_codec_dev_cfg_t in_cfg = { .dev_type = ESP_CODEC_DEV_TYPE_IN, .codec_if = codec, .data_if = data_if };
++    *spk = esp_codec_dev_new(&out_cfg);
++    *mic = esp_codec_dev_new(&in_cfg);
++    return *spk && *mic ? ESP_OK : ESP_FAIL;
++}
++
++/*
++ * BOOT is small and stiff: a thumb holding it while talking lifts for a moment
++ * now and then, and each lift used to end the recording after 1 to 3 s. A
++ * release only counts once the button has stayed up for TALK_SLIP_US; a press
++ * before that is the same hold.
++ */
++static unsigned talk_filtered(void)
++{
++    static bool pending;
++    static int64_t up_at;
++    unsigned ev = muse_gpio_button_poll(&s_talk);
++    int64_t now = esp_timer_get_time();
++    if (ev & MUSE_BTN_TALK_RELEASE) {
++        ev &= ~MUSE_BTN_TALK_RELEASE;
++        pending = true;
++        up_at = now;
++    }
++    if (pending && (ev & MUSE_BTN_TALK_PRESS)) {
++        ev &= ~MUSE_BTN_TALK_PRESS;
++        pending = false;
++        ESP_LOGI(TAG, "talk key slipped for %d ms; still held", (int)((now - up_at) / 1000));
++    }
++    if (pending && now - up_at >= TALK_SLIP_US) {
++        pending = false;
++        ev |= MUSE_BTN_TALK_RELEASE;
++    }
++    return ev;
++}
++
++static unsigned poll_buttons(void)
++{
++    static unsigned tick;
++    unsigned ev = talk_filtered();   /* BOOT talks, PWR is aux */
++    if (tick++ % PMU_KEY_EVERY == 0) {
++        unsigned key = muse_pmu_poll_key();
++        ev |= (key & MUSE_PMU_KEY_PRESS ? MUSE_BTN_AUX_PRESS : 0) |
++              (key & MUSE_PMU_KEY_RELEASE ? MUSE_BTN_AUX_RELEASE : 0);
++    }
++    return ev;
++}
++
++static const muse_board_t s_board = {
++    .name = "Waveshare ESP32-S3-Touch-AMOLED-1.8",
++    .width = LCD_H_RES,
++    .height = LCD_V_RES,
++    .round = false,
++    .touch = true,
++    .diagonal_in = 1.8f,
++    .talk_button = "boot",
++    .aux_button = "pwr",
++    /* Both buttons are on the right side, BOOT above PWR (checked on the board). */
++    .talk_hint = { LV_ALIGN_RIGHT_MID, -12, -60 },
++    .aux_hint = { LV_ALIGN_RIGHT_MID, -12, 60 },
++    .frame_ms = 40,
++    .init = init,
++    .display_start = display_start,
++    .display_lock = display_lock,
++    .display_unlock = esp_lv_adapter_unlock,
++    .set_brightness = set_brightness,
++    .panel_sleep = panel_sleep,
++    .display_pause = display_pause,
++    .audio_init = audio_init,
++    .mic_slot = 0,              /* one mic, on the left slot */
++    .poll_buttons = poll_buttons,
++    /* PWR is on the PMU, so the buttons are polled. */
++    .read_power = muse_pmu_read_power,
++    .power_off = muse_pmu_power_off,
++};
++
++/* Home Link's app_main starts Muse with this board (main/main.c). */
++const muse_board_t *muse_board_get(void)
++{
++    return &s_board;
++}
+diff --git a/esp32/components/muse/idf_component.yml b/esp32/components/muse/idf_component.yml
+index 4837550..b807828 100644
+--- a/esp32/components/muse/idf_component.yml
++++ b/esp32/components/muse/idf_component.yml
+@@ -29,7 +29,7 @@ dependencies:
+   espressif/esp_lvgl_adapter:
+     version: "0.6.4"
+     rules:
+-      - if: "$CONFIG{MUSE_BOARD_ID} in [\"waveshare_s3_175c\", \"waveshare_s3_175\", \"aipi\", \"m5stack_cardputer_adv\", \"sensecap_watcher\", \"m5stack_sticks3\", \"m5stack_stickc_plus2\", \"m5stack_stopwatch\"]"
++      - if: "$CONFIG{MUSE_BOARD_ID} in [\"waveshare_s3_175c\", \"waveshare_s3_175\", \"waveshare_s3_18\", \"aipi\", \"m5stack_cardputer_adv\", \"sensecap_watcher\", \"m5stack_sticks3\", \"m5stack_stickc_plus2\", \"m5stack_stopwatch\"]"
+   waveshare/esp32_s3_touch_amoled_1_75c:
+     version: "^3.0.0"
+     rules:
+@@ -57,4 +57,4 @@ dependencies:
+   espressif/esp_lcd_co5300:
+     version: "^2.2.0"
+     rules:
+-      - if: "$CONFIG{MUSE_BOARD_ID} == \"m5stack_stopwatch\""
++      - if: "$CONFIG{MUSE_BOARD_ID} in [\"m5stack_stopwatch\", \"waveshare_s3_18\"]"
+diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
+index 05fe181..d5b65c0 100644
+--- a/esp32/components/muse/muse_chat_session.cpp
++++ b/esp32/components/muse/muse_chat_session.cpp
+@@ -69,6 +69,7 @@ extern "C" {
+ #include "muse_account_api.h"
+ #include "muse_link.h"
+ #include "muse_settings.h"
++#include "muse_tts_openai.h"
+ #include "muse_wifi.h"
+ }
+ #include "muse_chat_priv.h"
+@@ -122,7 +123,7 @@ static const char *TAG = "muse_chat_session";
+  * server transcribes it. Set to 0 to stream to /api/voice/dictation instead.
+  */
+ #define VOICE_NOTE 1
+-#define NOTE_MAX_BYTES (MIC_RATE * 2 * 20) /* 20 s of 16 kHz PCM; Muse stops at 15 */
++#define NOTE_MAX_BYTES (MIC_RATE * 2 * 65) /* 65 s of 16 kHz PCM; the voice task stops at 60 (local: upstream 20) */
+ #define NOTE_PART_BYTES (DICT_CHUNK_BYTES / 4 * 3)   /* staged PCM that base64s to one body chunk */
+ 
+ #define MAX_MSGS 8
+@@ -248,6 +249,7 @@ struct turn_t {
+ /* 10 KB, most of it the MP3 decoder: in PSRAM on boards that let static data go
+  * there (the AIPI), so Wi-Fi setup and TLS have the internal RAM. */
+ EXT_RAM_BSS_ATTR static turn_t s_turn;
++static uint32_t s_tts_id;   /* the OpenAI speech request for s_turn.tts_msg */
+ 
+ /* Turn milestones, logged together when the turn ends. */
+ enum mark_t : uint8_t { M_RELEASE, M_SENT, M_ACK, M_TEXT, M_DONE, M_TTS, M_MP3, M_AUDIO, M_COUNT };
+@@ -952,6 +954,7 @@ static void turn_reset_streams(void)
+ static void turn_finish(void)
+ {
+     turn_reset_streams();
++    muse_tts_cancel();
+     s_turn.phase = P_IDLE;
+     s_turn.dict_id = s_turn.chat_id = 0;
+     s_turn.tts_msg = -1;
+@@ -1016,6 +1019,10 @@ static void turn_begin(uint32_t gen)
+     if (!turn_start(gen, false)) {
+         return;
+     }
++    /* Speech comes after the reply; open the connection while they talk. */
++    if (muse_settings_speaker_on() && muse_settings_volume() > 0) {
++        muse_tts_prewarm();
++    }
+     if (VOICE_NOTE) {
+         if (!open_note()) {
+             disconnect("chat open failed");
+@@ -1517,6 +1524,24 @@ static void start_tts(void)
+          * end. decode() plays it at the speaker's volume, captions following,
+          * and finishes the message once it's drained.
+          */
++        /* Speaker on and an OpenAI key compiled in: speak it (muse_tts_openai.c). */
++        if (!s_turn.text && s_turn.texts && muse_settings_speaker_on() && muse_settings_volume() > 0 &&
++            muse_tts_request(++s_tts_id, s_turn.texts + i * TEXT_MAX)) {
++            m.tts = TTS_ACTIVE;
++            s_turn.tts_msg = i;
++            s_turn.silent = false;
++            m.pcm_start = s_turn.pcm_out;
++            m.pcm_frames = 0;
++            s_turn.mp3_len = 0;
++            s_turn.mp3_ended = false;
++            s_turn.kbps = 0;
++            s_turn.down_rate = 0;
++            mp3dec_init(&s_turn.dec);
++            mark(M_TTS);
++            ESP_LOGI(TAG, "speaking message %s (%u chars)", m.id, (unsigned)m.len);
++            show_reply_start(m);
++            return;
++        }
+         m.pcm_start = s_turn.pcm_out;
+         m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
+         m.tts = TTS_ACTIVE;
+@@ -1554,6 +1579,37 @@ static void tts_end(stream_t *s, bool ok)
+     }
+ }
+ 
++/* Moves OpenAI's MP3 into the decoder's buffer; falls back to text pacing if it fails. */
++static void tts_pump(void)
++{
++    if (s_turn.tts_msg < 0 || s_turn.silent || s_turn.mp3_ended) {
++        return;
++    }
++    int st = muse_tts_status(s_tts_id);
++    bool drained = true;
++    while (s_turn.mp3_len < MP3_BUF) {
++        size_t n = muse_tts_read(s_tts_id, s_turn.mp3 + s_turn.mp3_len, MP3_BUF - s_turn.mp3_len);
++        if (!n) {
++            break;
++        }
++        mark(M_MP3);
++        s_turn.mp3_len += n;
++        drained = s_turn.mp3_len < MP3_BUF;
++    }
++    if (st == MUSE_TTS_DONE && drained) {
++        s_turn.mp3_ended = true;   /* decode() drains the rest, then finishes */
++    } else if (st == MUSE_TTS_FAILED) {
++        msg_t &m = s_turn.msgs[s_turn.tts_msg];
++        if (s_turn.pcm_out == m.pcm_start && !s_turn.mp3_len) {
++            ESP_LOGW(TAG, "speech failed, showing the reply instead");
++            m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
++            s_turn.silent = true;
++        } else {
++            s_turn.mp3_ended = true;   /* play what arrived */
++        }
++    }
++}
++
+ /* Speaker off: queues the shown message's silence while the reply buffer has room. */
+ static void pace_silently(void)
+ {
+@@ -1976,6 +2032,7 @@ static void hatch_task(void *arg)
+         }
+         if (s_turn.phase == P_WAIT_REPLY) {
+             start_tts();
++            tts_pump();
+             decode();
+         }
+         if (!s_connected) {
+@@ -2038,6 +2095,7 @@ extern "C" void muse_hatch_start(void)
+         s.cap = NDJSON_LINE_MAX;
+     }
+     s_turn.tts_msg = -1;
++    muse_tts_start();
+     /* Stack in PSRAM: TLS, Noise and the MP3 decoder (~16 KB of scratch) all run here. */
+     if (!s_cmds || !s_events || !s_in || !s_out || !s_turn.chunk || !s_turn.mp3 || (VOICE_NOTE && !s_turn.note) || !s_pcm || !s_pcm16 ||
+         xTaskCreatePinnedToCoreWithCaps(hatch_task, "muse_chat", 48 * 1024, nullptr, 5, nullptr, 0,
+diff --git a/esp32/components/muse/muse_settings_ui.c b/esp32/components/muse/muse_settings_ui.c
+index e645636..11e5655 100644
+--- a/esp32/components/muse/muse_settings_ui.c
++++ b/esp32/components/muse/muse_settings_ui.c
+@@ -823,11 +823,10 @@ static void tick_wifi(void)
+ static void on_hatch_host_done(const char *text) { muse_settings_set_hatch_host(text); }
+ static void on_hatch_vm_done(const char *text) { muse_settings_set_hatch_vm(text); }
+ 
++/* Empty clears it, so Link's pairing is used again. */
+ static void on_hatch_token_done(const char *text)
+ {
+-    if (text[0]) {
+-        muse_settings_set_hatch_token(text, false);
+-    }
++    muse_settings_set_hatch_token(text, false);
+ }
+ 
+ static void on_hatch_host(lv_event_t *e)
+diff --git a/esp32/components/muse/muse_tts_openai.c b/esp32/components/muse/muse_tts_openai.c
+new file mode 100644
+index 0000000..aa7003f
+--- /dev/null
++++ b/esp32/components/muse/muse_tts_openai.c
+@@ -0,0 +1,366 @@
++/*
++ * Local addition for the Mini AI project, not part of upstream Muse.
++ * Licensed under the Apache License, Version 2.0, like the rest of this SDK.
++ */
++
++/*
++ * OpenAI speech for Muse's replies. The session task hands over a message's
++ * text; this task POSTs it and streams the MP3 into a buffer the session task
++ * drains into its decoder (start_tts in muse_chat_session.cpp). The key is
++ * compiled in (CONFIG_MUSE_TTS_OPENAI_KEY), so anyone holding the board can
++ * read it out of flash: give it a low spending limit.
++ */
++#include "muse_tts_openai.h"
++
++#include <stdio.h>
++#include <string.h>
++
++#include "cJSON.h"
++#include "esp_crt_bundle.h"
++#include "esp_heap_caps.h"
++#include "esp_http_client.h"
++#include "esp_log.h"
++#include "esp_timer.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/idf_additions.h"
++#include "freertos/semphr.h"
++#include "freertos/stream_buffer.h"
++#include "freertos/task.h"
++#include "sdkconfig.h"
++
++static const char *TAG = "muse_tts";
++
++#ifndef CONFIG_MUSE_TTS_OPENAI_KEY
++#define CONFIG_MUSE_TTS_OPENAI_KEY ""
++#define CONFIG_MUSE_TTS_OPENAI_MODEL "gpt-4o-mini-tts"
++#define CONFIG_MUSE_TTS_OPENAI_VOICE "coral"
++#define CONFIG_MUSE_TTS_OPENAI_INSTRUCTIONS ""
++#endif
++
++#define TTS_URL "https://api.openai.com/v1/audio/speech"
++#define MODELS_URL "https://api.openai.com/v1/models/" CONFIG_MUSE_TTS_OPENAI_MODEL   /* free, small: opens the connection */
++#define MP3_STREAM_BYTES (64 * 1024)
++#define READ_CHUNK 4096
++#define TIMEOUT_MS 20000
++
++static SemaphoreHandle_t s_lock;
++static TaskHandle_t s_task;
++static StreamBufferHandle_t s_mp3;
++static char *s_text;                 /* the waiting request's text, under s_lock */
++static uint32_t s_want;              /* the request wanted, under s_lock; 0 = none */
++static volatile uint32_t s_stream_id;    /* whose bytes s_mp3 holds */
++static volatile uint32_t s_status_id;
++static volatile int s_status;
++
++static bool wanted(uint32_t id)
++{
++    xSemaphoreTake(s_lock, portMAX_DELAY);
++    bool w = s_want == id;
++    xSemaphoreGive(s_lock);
++    return w;
++}
++
++static char *build_body(const char *text)
++{
++    cJSON *j = cJSON_CreateObject();
++    if (!j) {
++        return NULL;
++    }
++    cJSON_AddStringToObject(j, "model", CONFIG_MUSE_TTS_OPENAI_MODEL);
++    cJSON_AddStringToObject(j, "voice", CONFIG_MUSE_TTS_OPENAI_VOICE);
++    cJSON_AddStringToObject(j, "input", text);
++    cJSON_AddStringToObject(j, "response_format", "mp3");
++    if (CONFIG_MUSE_TTS_OPENAI_INSTRUCTIONS[0]) {
++        cJSON_AddStringToObject(j, "instructions", CONFIG_MUSE_TTS_OPENAI_INSTRUCTIONS);
++    }
++    char *body = cJSON_PrintUnformatted(j);
++    cJSON_Delete(j);
++    return body;
++}
++
++/* Hands buf to the session task, waiting for room while the request is still wanted. */
++static bool push(uint32_t id, const uint8_t *buf, size_t len)
++{
++    while (len) {
++        size_t n = xStreamBufferSend(s_mp3, buf, len, pdMS_TO_TICKS(100));
++        buf += n;
++        len -= n;
++        if (len && !wanted(id)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++/*
++ * One client for every request, so its TLS connection is reused while
++ * OpenAI keeps it open: a fresh handshake costs about a second here. Only
++ * this task touches it.
++ */
++static esp_http_client_handle_t s_client;
++static char *s_auth;
++static int64_t s_last_use_us;        /* when the connection last carried a request */
++static volatile bool s_warm;         /* muse_tts_prewarm() asked for a connection */
++
++/* Where the response body goes for the request in progress. */
++static struct {
++    uint32_t id;        /* 0: a warm-up, whose body is dropped */
++    bool ok;            /* still pushing */
++    size_t total;
++    int64_t first_us;
++    char err[160];      /* the start of an error body */
++    size_t err_len;
++} s_rx;
++
++static esp_err_t on_http(esp_http_client_event_t *evt)
++{
++    if (evt->event_id != HTTP_EVENT_ON_DATA || !evt->data_len) {
++        return ESP_OK;
++    }
++    if (esp_http_client_get_status_code(evt->client) != 200) {
++        size_t n = evt->data_len < sizeof(s_rx.err) - 1 - s_rx.err_len ? evt->data_len
++                                                                     : sizeof(s_rx.err) - 1 - s_rx.err_len;
++        memcpy(s_rx.err + s_rx.err_len, evt->data, n);
++        s_rx.err_len += n;
++        s_rx.err[s_rx.err_len] = '\0';
++        return ESP_OK;
++    }
++    if (!s_rx.id) {
++        return ESP_OK;
++    }
++    if (!s_rx.total) {
++        s_rx.first_us = esp_timer_get_time();
++    }
++    s_rx.total += evt->data_len;
++    if (s_rx.ok && !push(s_rx.id, evt->data, evt->data_len)) {
++        s_rx.ok = false;   /* cancelled: read the rest and drop it, keeping the connection */
++    }
++    return ESP_OK;
++}
++
++static bool client_ready(void)
++{
++    if (s_client) {
++        return true;
++    }
++    const esp_http_client_config_t cfg = {
++        .url = TTS_URL,
++        .timeout_ms = TIMEOUT_MS,
++        .buffer_size = READ_CHUNK,
++        .buffer_size_tx = 2048,
++        .event_handler = on_http,
++        .crt_bundle_attach = esp_crt_bundle_attach,
++        .keep_alive_enable = true,
++    };
++    s_client = esp_http_client_init(&cfg);
++    if (!s_client) {
++        return false;
++    }
++    esp_http_client_set_header(s_client, "Authorization", s_auth);
++    return true;
++}
++
++/* One request on the shared client, retried once on a fresh connection if the old one had closed. */
++static esp_err_t perform(void)
++{
++    bool reused = s_last_use_us && esp_timer_get_time() - s_last_use_us < 120 * 1000000LL;
++    esp_err_t err = esp_http_client_perform(s_client);
++    if (err != ESP_OK && reused && !s_rx.total) {
++        ESP_LOGI(TAG, "kept connection had closed (%s); reconnecting", esp_err_to_name(err));
++        esp_http_client_close(s_client);
++        s_rx.err_len = 0;
++        err = esp_http_client_perform(s_client);
++    }
++    if (err == ESP_OK) {
++        s_last_use_us = esp_timer_get_time();
++    } else {
++        esp_http_client_close(s_client);
++        s_last_use_us = 0;
++    }
++    return err;
++}
++
++/* Opens the TLS connection ahead of the reply with a free request, unless one is fresh. */
++static void warm_up(void)
++{
++    if (s_last_use_us && esp_timer_get_time() - s_last_use_us < 30 * 1000000LL) {
++        return;
++    }
++    if (!client_ready()) {
++        return;
++    }
++    int64_t t0 = esp_timer_get_time();
++    s_rx.id = 0;
++    s_rx.err_len = 0;
++    s_rx.total = 0;
++    esp_http_client_set_url(s_client, MODELS_URL);
++    esp_http_client_set_method(s_client, HTTP_METHOD_GET);
++    esp_http_client_set_post_field(s_client, NULL, 0);
++    esp_err_t err = perform();
++    ESP_LOGI(TAG, "warm-up: %s in %d ms", err == ESP_OK ? "connected" : esp_err_to_name(err),
++             (int)((esp_timer_get_time() - t0) / 1000));
++}
++
++static int fetch(uint32_t id, const char *text)
++{
++    char *body = build_body(text);
++    if (!body || !client_ready()) {
++        ESP_LOGW(TAG, "out of memory");
++        free(body);
++        return MUSE_TTS_FAILED;
++    }
++    int64_t t0 = esp_timer_get_time();
++    bool warm = s_last_use_us != 0;
++    s_rx.id = id;
++    s_rx.ok = true;
++    s_rx.total = 0;
++    s_rx.first_us = 0;
++    s_rx.err_len = 0;
++    esp_http_client_set_url(s_client, TTS_URL);
++    esp_http_client_set_method(s_client, HTTP_METHOD_POST);
++    esp_http_client_set_header(s_client, "Content-Type", "application/json");
++    esp_http_client_set_post_field(s_client, body, strlen(body));
++    esp_err_t err = perform();
++    esp_http_client_delete_header(s_client, "Content-Type");
++    esp_http_client_set_post_field(s_client, NULL, 0);
++    free(body);
++    int status = err == ESP_OK ? esp_http_client_get_status_code(s_client) : 0;
++    if (err != ESP_OK) {
++        ESP_LOGW(TAG, "can't reach the speech API (%s)", esp_err_to_name(err));
++        return MUSE_TTS_FAILED;
++    }
++    if (status != 200) {
++        ESP_LOGW(TAG, "speech API HTTP %d: %s", status, s_rx.err);
++        return MUSE_TTS_FAILED;
++    }
++    int64_t t1 = esp_timer_get_time();
++    ESP_LOGI(TAG, "speech: %u chars -> %u bytes of MP3, first byte %d ms, all %d ms (%s connection)",
++             (unsigned)strlen(text), (unsigned)s_rx.total,
++             s_rx.first_us ? (int)((s_rx.first_us - t0) / 1000) : -1, (int)((t1 - t0) / 1000),
++             warm ? "kept" : "new");
++    return s_rx.ok && s_rx.total ? MUSE_TTS_DONE : MUSE_TTS_FAILED;
++}
++
++static void tts_task(void *arg)
++{
++    (void)arg;
++    for (;;) {
++        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
++        for (;;) {
++            xSemaphoreTake(s_lock, portMAX_DELAY);
++            uint32_t id = s_want;
++            char *text = s_text;
++            s_text = NULL;
++            xSemaphoreGive(s_lock);
++            if (!id || !text) {
++                heap_caps_free(text);
++                if (s_warm) {
++                    s_warm = false;
++                    warm_up();
++                    continue;   /* a request may have come in meanwhile */
++                }
++                break;
++            }
++            s_warm = false;
++            /* The session task never blocks on s_mp3, so the reset can't fail;
++             * stale bytes from the last request go with it. */
++            xStreamBufferReset(s_mp3);
++            s_stream_id = id;
++            s_status_id = id;
++            s_status = MUSE_TTS_RUNNING;
++            int rc = fetch(id, text);
++            heap_caps_free(text);
++            if (s_status_id == id) {
++                s_status = rc;
++            }
++            if (wanted(id)) {
++                break;   /* nothing newer waiting */
++            }
++        }
++    }
++}
++
++void muse_tts_start(void)
++{
++    if (s_task || !CONFIG_MUSE_TTS_OPENAI_KEY[0]) {
++        return;
++    }
++    s_lock = xSemaphoreCreateMutex();
++    s_auth = heap_caps_malloc(sizeof(CONFIG_MUSE_TTS_OPENAI_KEY) + 8, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++    if (s_auth) {
++        snprintf(s_auth, sizeof(CONFIG_MUSE_TTS_OPENAI_KEY) + 8, "Bearer %s", CONFIG_MUSE_TTS_OPENAI_KEY);
++    }
++    s_mp3 = xStreamBufferCreateWithCaps(MP3_STREAM_BYTES, 1, MALLOC_CAP_SPIRAM);
++    /* TLS runs here; mbedTLS allocates from PSRAM on these boards. */
++    if (!s_lock || !s_auth || !s_mp3 ||
++        xTaskCreatePinnedToCoreWithCaps(tts_task, "muse_tts", 12 * 1024, NULL, 4, &s_task, 0,
++                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
++        ESP_LOGE(TAG, "start failed");
++        s_task = NULL;
++        return;
++    }
++    ESP_LOGI(TAG, "OpenAI speech on: %s, voice %s", CONFIG_MUSE_TTS_OPENAI_MODEL, CONFIG_MUSE_TTS_OPENAI_VOICE);
++}
++
++bool muse_tts_enabled(void)
++{
++    return s_task != NULL;
++}
++
++bool muse_tts_request(uint32_t id, const char *text)
++{
++    if (!s_task || !id || !text || !text[0]) {
++        return false;
++    }
++    size_t n = strlen(text) + 1;
++    char *copy = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++    if (!copy) {
++        return false;
++    }
++    memcpy(copy, text, n);
++    xSemaphoreTake(s_lock, portMAX_DELAY);
++    heap_caps_free(s_text);
++    s_text = copy;
++    s_want = id;
++    xSemaphoreGive(s_lock);
++    s_status_id = id;
++    s_status = MUSE_TTS_RUNNING;
++    xTaskNotifyGive(s_task);
++    return true;
++}
++
++void muse_tts_prewarm(void)
++{
++    if (s_task) {
++        s_warm = true;
++        xTaskNotifyGive(s_task);
++    }
++}
++
++void muse_tts_cancel(void)
++{
++    if (!s_task) {
++        return;
++    }
++    xSemaphoreTake(s_lock, portMAX_DELAY);
++    s_want = 0;
++    heap_caps_free(s_text);
++    s_text = NULL;
++    xSemaphoreGive(s_lock);
++}
++
++size_t muse_tts_read(uint32_t id, uint8_t *buf, size_t cap)
++{
++    if (!s_task || s_stream_id != id) {
++        return 0;
++    }
++    return xStreamBufferReceive(s_mp3, buf, cap, 0);
++}
++
++int muse_tts_status(uint32_t id)
++{
++    if (s_status_id != id) {
++        return MUSE_TTS_RUNNING;
++    }
++    return s_status;
++}
+diff --git a/esp32/components/muse/muse_tts_openai.h b/esp32/components/muse/muse_tts_openai.h
+new file mode 100644
+index 0000000..bd51e53
+--- /dev/null
++++ b/esp32/components/muse/muse_tts_openai.h
+@@ -0,0 +1,48 @@
++/*
++ * Local addition for the Mini AI project, not part of upstream Muse.
++ * Licensed under the Apache License, Version 2.0, like the rest of this SDK.
++ */
++#pragma once
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++ * Speaks Muse's replies with OpenAI's speech API (POST /v1/audio/speech, MP3).
++ * Off unless CONFIG_MUSE_TTS_OPENAI_KEY is set. One request at a time runs on
++ * its own task; the session task polls for the MP3 with muse_tts_read().
++ */
++
++/* Starts the fetch task. Call once. */
++void muse_tts_start(void);
++
++/* A key is compiled in and the task is running. */
++bool muse_tts_enabled(void);
++
++/* Fetches speech for text, tagged id, replacing any request in flight. False if it can't start. */
++bool muse_tts_request(uint32_t id, const char *text);
++
++/* Opens the connection to OpenAI ahead of a reply (at the press), unless one is fresh. */
++void muse_tts_prewarm(void);
++
++/* Stops the request in flight. */
++void muse_tts_cancel(void);
++
++/* Copies up to cap bytes of request id's MP3 without blocking; 0 when none is waiting. */
++size_t muse_tts_read(uint32_t id, uint8_t *buf, size_t cap);
++
++#define MUSE_TTS_RUNNING 0
++#define MUSE_TTS_DONE 1      /* every byte has been handed to muse_tts_read's buffer */
++#define MUSE_TTS_FAILED (-1)
++
++/* Where request id stands. */
++int muse_tts_status(uint32_t id);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/esp32/components/muse/muse_voice.c b/esp32/components/muse/muse_voice.c
+index d243fea..775e067 100644
+--- a/esp32/components/muse/muse_voice.c
++++ b/esp32/components/muse/muse_voice.c
+@@ -40,7 +40,7 @@
+ 
+ static const char *TAG = "muse_voice";
+ 
+-#define MAX_SECS 15
++#define MAX_SECS 60   /* local: upstream 15; 1.9 MB of PSRAM per note */
+ #define TAIL_FRAMES (MUSE_AUDIO_RATE * 12 / 100)   /* capture lag + poll interval, stops before the release click */
+ #define MAX_FRAMES (MUSE_AUDIO_RATE * MAX_SECS)
+ #define MIN_HELD_FRAMES (MUSE_AUDIO_RATE * 3 / 10)   /* shorter presses are taps, not speech */
+diff --git a/esp32/devices/sdkconfig.muse-waveshare-s3-18 b/esp32/devices/sdkconfig.muse-waveshare-s3-18
+new file mode 100644
+index 0000000..a039625
+--- /dev/null
++++ b/esp32/devices/sdkconfig.muse-waveshare-s3-18
+@@ -0,0 +1,70 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++# Waveshare ESP32-S3-Touch-AMOLED-1.8 V2 (CO5300 panel, CST820 touch): 16 MB flash, the
++# sdkconfig.muse default, and 8 MB octal PSRAM. Load last, after sdkconfig.muse.
++CONFIG_IDF_TARGET="esp32s3"
++CONFIG_MUSE_BOARD_WAVESHARE_S3_18=y
++
++CONFIG_SPIRAM=y
++CONFIG_SPIRAM_MODE_OCT=y
++CONFIG_SPIRAM_SPEED_80M=y
++CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
++CONFIG_SPIRAM_RODATA=y
++CONFIG_SPIRAM_XIP_FROM_PSRAM=y
++CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
++CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
++CONFIG_ESP32S3_DATA_CACHE_64KB=y
++CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
++
++CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=2
++CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
++CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
++# Static buffers in PSRAM: Wi-Fi's, lwIP's and BT's, and those marked
++# EXT_RAM_BSS_ATTR (Muse's chat turn, the tunnel batch). Without it light
++# sleep's code leaves Link under 16 KB of DMA RAM once connected, too little
++# to send link.register, so the tunnel never opens. The chip always has
++# PSRAM, so booting without it needn't be allowed.
++CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
++# CONFIG_SPIRAM_IGNORE_NOTFOUND is not set
++# That forces Wi-Fi's TX buffers static, in internal RAM: 8, not 16, at 1.6 KB
++# each, which voice over the tunnel doesn't fill.
++CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
++
++# Screen off on battery: the CPU drops to the crystal clock and light-sleeps
++# between button polls (muse_input.c). BLE has to allow that with modem sleep;
++# there's no 32 kHz crystal, so its sleep clock is the main crystal, kept
++# powered. On USB power the chip stays awake at full speed.
++CONFIG_PM_ENABLE=y
++CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
++CONFIG_BT_CTRL_MODEM_SLEEP=y
++CONFIG_BT_CTRL_MODEM_SLEEP_MODE_1=y
++CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL=y
++CONFIG_BT_CTRL_MAIN_XTAL_PU_DURING_LIGHT_SLEEP=y
++CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
++# The CPU stays powered in light sleep: saving its state takes 8.5 KB of
++# internal RAM, more than Wi-Fi can spare here.
++# CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP is not set
++# Pins keep their state in light sleep. This workaround would float them all,
++# panel and touch reset and the amp enable included.
++# CONFIG_ESP_SLEEP_GPIO_RESET_WORKAROUND is not set
++# For the battery meter (muse_battery.h, ">power" on the console): time
++# actually slept, and how long each power lock kept the chip awake.
++CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
++CONFIG_PM_PROFILING=y
++
++# OpenAI speech (muse_tts_openai.c): api.openai.com sends GTS Root R4 cross-signed
++# by GlobalSign Root CA (R1), which the bundle lacks. Without this the TLS check
++# fails with "No matching trusted root certificate found".
++CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+diff --git a/esp32/tools/muse/avatar.py b/esp32/tools/muse/avatar.py
+index b63235e..5c7dc58 100644
+--- a/esp32/tools/muse/avatar.py
++++ b/esp32/tools/muse/avatar.py
+@@ -61,6 +61,7 @@ BOARDS = {
+     "Espressif ESP32-S3-BOX-3": "box3",
+     "Waveshare ESP32-S3-Touch-AMOLED-1.75C": "s3",
+     "Waveshare ESP32-S3-Touch-AMOLED-1.75": "s3n",
++    "Waveshare ESP32-S3-Touch-AMOLED-1.8": "s318",
+     "AIPI Lite": "aipi",
+     "Waveshare ESP32-C6-Touch-AMOLED-1.8": "c6",
+     "Seeed SenseCAP Watcher": "watcher",
+@@ -69,7 +70,7 @@ BOARDS = {
+     "M5Stack StickC Plus2": "plus2",
+     "M5Stack StopWatch": "stopwatch",
+ }
+-CHAT_BOARDS = ("s3", "s3n", "aipi", "box3", "sticks3", "watcher", "stopwatch")
++CHAT_BOARDS = ("s3", "s3n", "s318", "aipi", "box3", "sticks3", "watcher", "stopwatch")
+ 
+ 
+ class Stop(Exception):
+diff --git a/esp32/tools/muse/board.sh b/esp32/tools/muse/board.sh
+index ae3ba6b..b7d048f 100755
+--- a/esp32/tools/muse/board.sh
++++ b/esp32/tools/muse/board.sh
+@@ -14,7 +14,7 @@
+ # limitations under the License.
+ 
+ # Build or flash Home Link for one board:
+-#   tools/muse/board.sh build|flash <s3|s3n|aipi|box3|c6|watcher|sticks3|plus2|cardputer-adv|stopwatch> [serial|port]
++#   tools/muse/board.sh build|flash <s3|s3n|s318|aipi|box3|c6|watcher|sticks3|plus2|cardputer-adv|stopwatch> [serial|port]
+ # Build log: /tmp/muse_build_<board>.log. flash finds the board's port by its
+ # USB device (tools/muse/ports.py); with several of a kind attached, pass the
+ # one's USB serial number (the MAC on native USB) or its port. Flashing from a
+@@ -23,11 +23,12 @@
+ # flashes in build-muse-<profile>-bench/, so neither build's sdkconfig hides
+ # the other's.
+ set -uo pipefail
+-cmd=${1:?build|flash}; board=${2:?s3|s3n|aipi|box3|c6|watcher|sticks3|plus2|cardputer-adv|stopwatch}
++cmd=${1:?build|flash}; board=${2:?s3|s3n|s318|aipi|box3|c6|watcher|sticks3|plus2|cardputer-adv|stopwatch}
+ root=$(cd "$(dirname "$0")/../.." && pwd)
+ case $board in
+     s3)      profile=waveshare-s3-175c;    target=esp32s3 ;;
+     s3n)     profile=waveshare-s3-175;     target=esp32s3 ;;
++    s318)    profile=waveshare-s3-18;      target=esp32s3 ;;
+     aipi)    profile=aipi;                 target=esp32s3 ;;
+     box3)    profile=espressif-box-3;       target=esp32s3 ;;
+     c6)      profile=waveshare-c6-18;      target=esp32c6 ;;
+diff --git a/esp32/tools/muse/ports.py b/esp32/tools/muse/ports.py
+index 132f56a..10fed46 100755
+--- a/esp32/tools/muse/ports.py
++++ b/esp32/tools/muse/ports.py
+@@ -35,6 +35,7 @@ CH9102 = (0x1A86, 0x55D4)   # WCH single UART bridge
+ USB = {
+     "s3": USJ,
+     "s3n": USJ,
++    "s318": USJ,
+     "aipi": USJ,
+     "box3": USJ,
+     "c6": USJ,
+@@ -46,7 +47,7 @@ USB = {
+ }
+ # Boards whose console takes Muse's serial commands (tools/muse/chat.py). The
+ # Watcher reads them on its CH342 port with MUSE_CONSOLE_UART.
+-COMMANDS = ("s3", "s3n", "aipi", "box3", "c6", "sticks3", "watcher", "plus2", "cardputer-adv", "stopwatch")
++COMMANDS = ("s3", "s3n", "s318", "aipi", "box3", "c6", "sticks3", "watcher", "plus2", "cardputer-adv", "stopwatch")
+ # Bridges that drop bytes when a whole packet arrives at once, so writes to them
+ # go 64 bytes at a time at the line rate (paced_esptool.py, chat.Board.write).
+ PACED = (CH342,)
