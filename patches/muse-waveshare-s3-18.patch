@@ -1156,18 +1156,32 @@ index 0000000..bd51e53
 +}
 +#endif
 diff --git a/esp32/components/muse/muse_voice.c b/esp32/components/muse/muse_voice.c
-index d243fea..775e067 100644
+index d243fea..0d83d15 100644
 --- a/esp32/components/muse/muse_voice.c
 +++ b/esp32/components/muse/muse_voice.c
-@@ -40,7 +40,7 @@
+@@ -40,12 +40,20 @@
  
  static const char *TAG = "muse_voice";
  
--#define MAX_SECS 15
++#if CONFIG_MUSE_HATCH
 +#define MAX_SECS 60   /* local: upstream 15; 1.9 MB of PSRAM per note */
++#else
++/* No Hatch session (HOLD_NOTES 0 below): the note streams live over Link and
++ * nothing is buffered, so MAX_FRAMES only caps the hold and scales the
++ * progress ring. Keep upstream's 15 s — a 60 s ring on a board that cannot
++ * hold a note reads as 45 s of lost recording. */
+ #define MAX_SECS 15
++#endif
  #define TAIL_FRAMES (MUSE_AUDIO_RATE * 12 / 100)   /* capture lag + poll interval, stops before the release click */
  #define MAX_FRAMES (MUSE_AUDIO_RATE * MAX_SECS)
  #define MIN_HELD_FRAMES (MUSE_AUDIO_RATE * 3 / 10)   /* shorter presses are taps, not speech */
+-#if CONFIG_MUSE_BOARD_M5STACK_CARDPUTER_ADV
+-#define PRE_CHUNKS 6                                   /* 120 ms; a 320 ms upload burst stalls on the ADV */
++#if CONFIG_MUSE_BOARD_M5STACK_CARDPUTER_ADV || CONFIG_MUSE_BOARD_WAVESHARE_C6_18
++#define PRE_CHUNKS 6                                   /* 120 ms; a 320 ms upload burst stalls on the ADV and C6 */
+ #else
+ #define PRE_CHUNKS 16                                  /* 320 ms of audio kept from before the press */
+ #endif
 diff --git a/esp32/devices/sdkconfig.muse-waveshare-s3-18 b/esp32/devices/sdkconfig.muse-waveshare-s3-18
 new file mode 100644
 index 0000000..a039625
@@ -1244,6 +1258,127 @@ index 0000000..a039625
 +# by GlobalSign Root CA (R1), which the bundle lacks. Without this the TLS check
 +# fails with "No matching trusted root certificate found".
 +CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+diff --git a/esp32/main/noise_control.cpp b/esp32/main/noise_control.cpp
+index b868de7..f3f3109 100644
+--- a/esp32/main/noise_control.cpp
++++ b/esp32/main/noise_control.cpp
+@@ -1841,24 +1841,20 @@ static session_result_t run_session(stack_monitor_t *stack) {
+     ClientSession session(crypto);
+ 
+     size_t ws_buf_size = WS_BUF_SIZE;
+-    ws_buf = static_cast<uint8_t *>(
+-        heap_caps_malloc(ws_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+-    if (!ws_buf) ws_buf = static_cast<uint8_t *>(malloc(ws_buf_size));
+-
+-    rx_buf = static_cast<uint8_t *>(
+-        heap_caps_malloc(WS_RX_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+-    if (!rx_buf) rx_buf = static_cast<uint8_t *>(malloc(WS_RX_BUF_SIZE));
+ 
++    // Largest first. Without PSRAM every one of these falls back to the
++    // internal pool, and taking the 17 KB blocks after the 6-7 KB ones leaves
++    // the last of them without a hole: ~46 KB still free, but the largest
++    // block down to ~14.8 KB against a 17 KB request. Size order keeps the big
++    // blocks in the big holes and lets the small ones use what is left.
++    //
+     // Crypto/framing scratch. PSRAM-preferred (with a heap fallback) so the
+     // 12 KB buffers don't land in internal SRAM — anything under
+     // CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL would otherwise be served from the
+     // scarce internal pool that WiFi/TLS/lwIP also need.
+-    svc_scratch = static_cast<uint8_t *>(
+-        heap_caps_malloc(OUT_SVC_SCRATCH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+-    if (!svc_scratch) svc_scratch = static_cast<uint8_t *>(malloc(OUT_SVC_SCRATCH));
+-    env_scratch = static_cast<uint8_t *>(
+-        heap_caps_malloc(OUT_ENV_SCRATCH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+-    if (!env_scratch) env_scratch = static_cast<uint8_t *>(malloc(OUT_ENV_SCRATCH));
++    rx_buf = static_cast<uint8_t *>(
++        heap_caps_malloc(WS_RX_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
++    if (!rx_buf) rx_buf = static_cast<uint8_t *>(malloc(WS_RX_BUF_SIZE));
+     tf_scratch = static_cast<uint8_t *>(
+         heap_caps_malloc(SVC_FRAME_SCRATCH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+     if (!tf_scratch) tf_scratch = static_cast<uint8_t *>(malloc(SVC_FRAME_SCRATCH));
+@@ -1866,6 +1862,16 @@ static session_result_t run_session(stack_monitor_t *stack) {
+         heap_caps_malloc(SVC_FRAME_SCRATCH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+     if (!sr_scratch) sr_scratch = static_cast<uint8_t *>(malloc(SVC_FRAME_SCRATCH));
+ 
++    ws_buf = static_cast<uint8_t *>(
++        heap_caps_malloc(ws_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
++    if (!ws_buf) ws_buf = static_cast<uint8_t *>(malloc(ws_buf_size));
++    svc_scratch = static_cast<uint8_t *>(
++        heap_caps_malloc(OUT_SVC_SCRATCH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
++    if (!svc_scratch) svc_scratch = static_cast<uint8_t *>(malloc(OUT_SVC_SCRATCH));
++    env_scratch = static_cast<uint8_t *>(
++        heap_caps_malloc(OUT_ENV_SCRATCH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
++    if (!env_scratch) env_scratch = static_cast<uint8_t *>(malloc(OUT_ENV_SCRATCH));
++
+     if (!ws_buf || !rx_buf || !svc_scratch || !env_scratch
+         || !tf_scratch || !sr_scratch) {
+         ESP_LOGE(TAG, "session buffer alloc failed");
+diff --git a/esp32/main/noise_tunnel.cpp b/esp32/main/noise_tunnel.cpp
+index fd3cabf..98c5b8e 100644
+--- a/esp32/main/noise_tunnel.cpp
++++ b/esp32/main/noise_tunnel.cpp
+@@ -64,9 +64,19 @@ extern "C" bool noise_tx_has_dma_headroom(size_t *dma_free) {
+ }
+ 
+ #if CONFIG_MUSE_ENABLED
++// Without the tunnel, Muse's 2 KB request chunks are all that cross here, and
++// on a PSRAM-less chip (C6) every internal byte is DMA-capable, so an idle
++// session can sit just above 16 KB: the first chunk of a voice note dips under
++// it and the note fails. The contiguous and TLS-block checks still apply.
++#if CONFIG_HOMEHUB_TUNNEL || CONFIG_SPIRAM
++static constexpr size_t NOISE_TX_REQ_DMA_RESERVE_BYTES = NOISE_TX_DMA_RESERVE_BYTES;
++#else
++static constexpr size_t NOISE_TX_REQ_DMA_RESERVE_BYTES = 8 * 1024;
++#endif
++
+ extern "C" bool noise_tx_has_dma_headroom_reclaiming(size_t reclaimable) {
+     return heap_caps_get_free_size(MALLOC_CAP_DMA) + reclaimable
+-        >= NOISE_TX_DMA_RESERVE_BYTES;
++        >= NOISE_TX_REQ_DMA_RESERVE_BYTES;
+ }
+ #endif
+ 
+diff --git a/esp32/tools/board.sh b/esp32/tools/board.sh
+index 6fdcc98..3be853d 100755
+--- a/esp32/tools/board.sh
++++ b/esp32/tools/board.sh
+@@ -102,6 +102,36 @@ if [ "$ACTION" != build ]; then
+   fi
+   echo ">> $BOARD on $PORT"
+   PORT_ARGS=(-p "$PORT")
++
++  # ideaspark and sensecap-indicator share the same CH340 port glob, and
++  # devkit and home-assistant-voice share the chip's native USB glob, so the
++  # one port found isn't necessarily this board. Before flashing, check the
++  # chip on it against what $BOARD expects: --no-stub keeps this to a plain
++  # ROM handshake, so it's quick and never gets as far as writing anything.
++  case "$ACTION" in
++    flash|flash-monitor)
++      DETECTED=$(python -m esptool --no-stub -p "$PORT" chip-id 2>&1 \
++        | sed -n 's/^Detecting chip type\.\.\. *//p' | head -1)
++      case "$DETECTED" in
++        ESP32)    DTARGET=esp32 ;;
++        ESP32-S3) DTARGET=esp32s3 ;;
++        ESP32-C5) DTARGET=esp32c5 ;;
++        ESP32-C6) DTARGET=esp32c6 ;;
++        "")       DTARGET="" ;;  # couldn't tell; leave it to idf.py's own check
++        *)        DTARGET="$DETECTED" ;;
++      esac
++      if [ -n "$DTARGET" ] && [ "$DTARGET" != "$TARGET" ]; then
++        echo "error: '$BOARD' expects $TARGET, but the board on $PORT is $DETECTED." >&2
++        case "$DTARGET" in
++          esp32)   echo "That's 'ideaspark'." >&2 ;;
++          esp32c5) echo "That's 'devkit'." >&2 ;;
++          esp32s3) echo "That's 'sensecap-indicator' or 'home-assistant-voice'." >&2 ;;
++          *)       echo "No board.sh profile here targets $DTARGET." >&2 ;;
++        esac
++        exit 1
++      fi
++      ;;
++  esac
+ fi
+ 
+ BUILD_DIR="$PROJECT/build-$BOARD"
 diff --git a/esp32/tools/muse/avatar.py b/esp32/tools/muse/avatar.py
 index b63235e..5c7dc58 100644
 --- a/esp32/tools/muse/avatar.py
@@ -1266,7 +1401,7 @@ index b63235e..5c7dc58 100644
  
  class Stop(Exception):
 diff --git a/esp32/tools/muse/board.sh b/esp32/tools/muse/board.sh
-index ae3ba6b..b7d048f 100755
+index ae3ba6b..64d0ec0 100755
 --- a/esp32/tools/muse/board.sh
 +++ b/esp32/tools/muse/board.sh
 @@ -14,7 +14,7 @@
@@ -1292,6 +1427,41 @@ index ae3ba6b..b7d048f 100755
      aipi)    profile=aipi;                 target=esp32s3 ;;
      box3)    profile=espressif-box-3;       target=esp32s3 ;;
      c6)      profile=waveshare-c6-18;      target=esp32c6 ;;
+@@ -74,6 +75,34 @@ if [ "$cmd" = build ]; then
+     exit $rc
+ fi
+ port=$(python "$root/tools/muse/ports.py" $board ${3:-}) || exit 1
++
++# Catch a board/profile mismatch (e.g. an S3 profile on a C6 board) before
++# esptool gets to write-flash, where it would still refuse but only after
++# connecting, with a message that doesn't say which board.sh name to use
++# instead. --no-stub keeps this to a plain ROM handshake at the default baud,
++# which also skips the Watcher's fragile stub upload over its unpaced CH342.
++detected=$(python -m esptool --no-stub -p "$port" chip-id 2>&1 \
++    | sed -n 's/^Detecting chip type\.\.\. *//p' | head -1)
++case "$detected" in
++    ESP32)    dtarget=esp32 ;;
++    ESP32-S3) dtarget=esp32s3 ;;
++    ESP32-C6) dtarget=esp32c6 ;;
++    ESP32-C5) dtarget=esp32c5 ;;
++    ESP32-C3) dtarget=esp32c3 ;;
++    "")       dtarget="" ;;  # couldn't tell; leave it to esptool's own check
++    *)        dtarget="$detected" ;;
++esac
++if [ -n "$dtarget" ] && [ "$dtarget" != "$target" ]; then
++    echo "error: '$board' expects $target, but the board on $port is $detected." >&2
++    case "$dtarget" in
++        esp32)   echo "That's 'plus2'." >&2 ;;
++        esp32c6) echo "That's 'c6'." >&2 ;;
++        esp32s3) echo "That's one of: s3, s3n, s318, aipi, box3, watcher, cardputer-adv, sticks3, stopwatch." >&2 ;;
++        *)       echo "No board.sh profile targets $dtarget yet." >&2 ;;
++    esac
++    exit 1
++fi
++
+ esptool="-m esptool"
+ [ -n "${paced:-}" ] && esptool="$root/tools/muse/paced_esptool.py"
+ cd $B && python $esptool --chip $target -p $port -b $baud --before default-reset --after hard-reset write-flash "@flash_args" 2>&1 | tail -3
 diff --git a/esp32/tools/muse/ports.py b/esp32/tools/muse/ports.py
 index 132f56a..10fed46 100755
 --- a/esp32/tools/muse/ports.py
